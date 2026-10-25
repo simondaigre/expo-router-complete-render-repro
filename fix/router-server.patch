@@ -1,0 +1,108 @@
+--- a/build/server/renderStreamingContent.js
++++ b/build/server/renderStreamingContent.js
+@@ -34,6 +34,13 @@
+     };
+     return data;
+ }
++function _expoconstants() {
++    const data = /*#__PURE__*/ _interop_require_default(require("expo-constants"));
++    _expoconstants = function() {
++        return data;
++    };
++    return data;
++}
+ function _server() {
+     const data = /*#__PURE__*/ _interop_require_wildcard(require("expo-font/build/server"));
+     _server = function() {
+@@ -193,6 +200,38 @@
+     debug(`Pushing fonts: (count: ${descriptors.length})`, descriptors);
+     return (0, _react1.createInjectedFontsAsNodes)(descriptors);
+ }
++function isStreamingEnabled() {
++    return _expoconstants().default.expoConfig?.extra?.router?.streaming !== false;
++}
++/**
++ * The longest time that server output waits for Suspense boundaries when streaming is disabled.
++ * The render is then aborted, and the browser renders the boundaries that are still pending.
++ */ const COMPLETE_RENDER_TIMEOUT_MS = 10_000;
++/** Aborts with `signal`, or when `abort()` is called. */ function createLinkedAbortController(signal) {
++    const controller = new AbortController();
++    if (signal?.aborted) {
++        controller.abort(signal.reason);
++    } else {
++        signal?.addEventListener('abort', ()=>controller.abort(signal.reason), {
++            once: true
++        });
++    }
++    return controller;
++}
++/** Waits for all Suspense boundaries, then aborts the boundaries still pending after the timeout. */ async function waitForAllReady(stream, controller) {
++    let timeout;
++    const isReady = await Promise.race([
++        stream.allReady.then(()=>true),
++        new Promise((resolve)=>{
++            timeout = setTimeout(()=>resolve(false), COMPLETE_RENDER_TIMEOUT_MS);
++        })
++    ]).finally(()=>clearTimeout(timeout));
++    if (!isReady) {
++        console.warn(`SSR render: Suspense boundaries did not resolve within ${COMPLETE_RENDER_TIMEOUT_MS} ms. The browser renders them.`);
++        controller.abort(new Error(`Server render timed out after ${COMPLETE_RENDER_TIMEOUT_MS} ms`));
++        await stream.allReady;
++    }
++}
+ async function getStreamingContent(location, options) {
+     return _server().withServerContext(async ()=>{
+         const { headContext, element, getStyleElement, loadedData } = prepareRenderContext(location, options);
+@@ -217,6 +256,10 @@
+             ]
+         };
+         const isStatic = options.output === 'static';
++        const shouldWaitForAllReady = !isStatic && !isStreamingEnabled();
++        // Lets the render be aborted after the timeout, as well as with the request.
++        const abortController = shouldWaitForAllReady ? createLinkedAbortController(options.request?.signal) : null;
++        const signal = abortController?.signal ?? options.request?.signal;
+         const renderErrors = [];
+         const stream = await _server2().default.renderToReadableStream(/*#__PURE__*/ (0, _jsxruntime().jsx)(_server1().ServerDocument, {
+             data: serverDocumentData,
+@@ -233,9 +276,9 @@
+                 hydrate: options.hydrate ?? true,
+                 loadedData
+             }) || undefined,
+-            signal: options.request?.signal,
++            signal,
+             onError (error) {
+-                if (options.request?.signal.aborted) {
++                if (signal?.aborted) {
+                     return;
+                 }
+                 if (isStatic) {
+@@ -245,14 +288,23 @@
+                 }
+             }
+         });
+-        if (isStatic) {
+-            await stream.allReady;
+-            if (renderErrors.length > 0) {
+-                throw renderErrors[0];
++        try {
++            if (isStatic) {
++                await stream.allReady;
++                if (renderErrors.length > 0) {
++                    throw renderErrors[0];
++                }
++                return await new Response(stream).text();
++            }
++            if (abortController) {
++                await waitForAllReady(stream, abortController);
+             }
+-            return new Response(stream).text();
++            return stream;
++        } catch (error) {
++            // Stops the render: nothing reads the stream after this.
++            await stream.cancel(error).catch(()=>{});
++            throw error;
+         }
+-        return stream;
+     });
+ }
+ 
